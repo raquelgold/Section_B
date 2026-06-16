@@ -12,6 +12,7 @@ PUBLIC_QUERIES_PATH = DATA_DIR / "public_queries.json"
 ARTIFACTS_DIR = STUDENT_ROOT / "artifacts"
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L6-v2"
 K_EVAL = 10
 
 
