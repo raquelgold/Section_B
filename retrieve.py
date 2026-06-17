@@ -9,7 +9,6 @@ import numpy as np
 from sentence_transformers import CrossEncoder
 import torch
 
-from chunk import chunk_entry
 from embed import embed_queries
 from index import load_index
 from utils import K_EVAL, CROSS_ENCODER_MODEL_NAME, iter_entries, entry_text
@@ -47,9 +46,11 @@ def search_batch(
         return [[] for _ in queries]
 
     top_n = 5 * top_k
+    top_chunks_per_page = 3
 
-    records = list(iter_entries())
-    pid_to_text = {int(r["page_id"]): entry_text(r) for r in records}
+    pid_to_chunk_indices = defaultdict(list)
+    for idx, pid in enumerate(page_ids):
+        pid_to_chunk_indices[int(pid)].append(idx)
 
     scores = query_vectors @ corpus_vectors.T
 
@@ -79,15 +80,36 @@ def search_batch(
         candidate_pids = [unique_pids[idx] for idx in top_n_indices]
 
         pairs = []
+        pair_to_pid_map = []
+
         for pid in candidate_pids:
-            doc_text = pid_to_text.get(int(pid), "")
-            pairs.append((query_str, doc_text))
+            global_chunk_indices = pid_to_chunk_indices[pid]
+            page_chunk_scores = row[global_chunk_indices]
+            top_sub_indices = np.argsort(-page_chunk_scores)[:top_chunks_per_page]
+            selected_global_indices = [global_chunk_indices[i] for i in top_sub_indices]
+            for ch_idx in selected_global_indices:
+                pairs.append((query_str, corpus_texts[ch_idx]))
+                pair_to_pid_map.append(pid)
+        if not pairs:
+            ranked.append(candidate_pids[:top_k])
+            continue
 
         rerank_scores = cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False)
 
-        final_top_indices = np.argsort(-rerank_scores)[:top_k]
-        final_pids = [candidate_pids[idx] for idx in final_top_indices]
+        pid_to_ce_scores = defaultdict(list)
+        for score, pid in zip(rerank_scores, pair_to_pid_map):
+            pid_to_ce_scores[pid].append(score)
+        pid_final_scores = {}
+        for pid in candidate_pids:
+            ce_list = pid_to_ce_scores.get(pid, [])
+            pid_final_scores[int(pid)] = np.mean(ce_list) if ce_list else -np.inf
+
+        final_pids = sorted(candidate_pids, key=lambda pid: pid_final_scores[pid], reverse=True)[:top_k]
         ranked.append(final_pids)
 
-    print(f"Found {sum([len(r) for r in ranked])} ranked pages\n")
+        print(f"\nQuery {query_idx}")
+        print(f"Candidate pages: {candidate_pids}")
+        print(f"Final pages: {final_pids}")
+
+    print(f"\nFound {sum([len(r) for r in ranked])} ranked pages\n")
     return ranked

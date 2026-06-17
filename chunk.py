@@ -42,9 +42,9 @@ def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
     n = len(tokens)
 
     configs = [
-        (512, 150),
-        (256, 50),
-        (128, 10)
+        (512, 50),
+        (256, 25),
+        (128, 10),
     ]
     chunks: List[Chunk] = []
     chunk_id = 0
