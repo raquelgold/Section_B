@@ -34,7 +34,7 @@ Run once locally to create `artifacts/`.
 python scripts/build_index.py
 ```
 
-### Artifacts produced (submit all of these)
+### Artifacts produced
 
 | Path | Contents |
 |------|----------|
@@ -43,8 +43,7 @@ python scripts/build_index.py
 
 Row `i` of `index_vectors.npy` corresponds to entry `i` in each list in
 `index_meta.json`. At query time `retrieve.py` loads both, scores chunks, then
-aggregates chunk scores up to `page_id`. Rebuild whenever the corpus or chunking
-changes.
+aggregates chunk scores up to `page_id`.
 
 ## Public self-test
 
