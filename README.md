@@ -1,26 +1,34 @@
 # Section B — Retrieval pipeline
 
-Two-stage page retrieval over the Wikipedia corpus: a bi-encoder retrieves
-candidate pages, a cross-encoder re-ranks them. Scored by **mean NDCG@10** via
-`run(queries)` in `main.py`. Index building is offline (not timed); query
-embedding + retrieval is the timed path.
+Implementation of an end-to-end retrieval pipeline over a collection of textual
+Wikipedia-style entries. The system receives a batch of queries and returns, for each
+query, a ranked list of relevant page id values.
 
 ## Setup
 
 ```bash
-cd path/to/student
+cd student@dpagpu2025s-0038:~/our_solution/Section_B/Section_B  #WE NEED TO CLEAN THIS AFTERWARDS SO THAT IT DOESNT HAVE SECTION_b DUPLICATE
 pip install -r requirements.txt
 ```
+### GPU (CUDA) torch
+ 
+To pull a CUDA-enabled torch build, `requirements.txt` includes a PyTorch index
+and a CUDA-tagged pin:
+ 
+```
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+```
+ 
+`pip install -r requirements.txt` then installs the GPU wheel automatically. 
 
-Corpus lives at **`data/Wikipedia Entries/`** (included in the handout).
 Models download from the Hugging Face Hub on first use and are cached after:
 `all-MiniLM-L6-v2` (bi-encoder, 384-dim) and `ms-marco-MiniLM-L6-v2`
-(cross-encoder). GPU is auto-detected; CPU works as a fallback.
+(cross-encoder).
 
-## Build index (offline, not timed — your machine only)
+## Build index (offline)
 
-Run once locally to create `artifacts/`. **Submit these files** in your repo;
-staff do not rebuild the index at grading time.
+Run once locally to create `artifacts/`. 
 
 ```bash
 python scripts/build_index.py
@@ -40,29 +48,16 @@ changes.
 
 ## Public self-test
 
-After building, verify a fresh run loads your submitted artifacts (no rebuild):
-
 ```bash
 python scripts/eval_public.py
 ```
 
-This loads `artifacts/`, runs `run()` over `data/public_queries.json`, and
-reports mean NDCG@10 (cutoff and final list length are `K_EVAL = 10`). A clean
-self-test confirms the submitted artifacts are sufficient on their own.
+This loads `artifacts/`, runs `run()` over `data/public_queries.json`, and reports mean NDCG@10.
 
-## Pipeline (what `run()` does at query time)
+## Our Pipeline (what `run()` does at query time)
 
-1. Embed the query batch (bi-encoder, L2-normalized).
-2. Dot-product against all chunk vectors (= cosine), then average per page.
+1. Embed the query batch.
+2. Dot-product against all chunk vectors, then average per page.
 3. Keep the top `5 × K` candidate pages.
 4. Re-rank: cross-encoder scores the top 3 chunks of each candidate, averaged per page.
 5. Return the top `K = 10` page IDs per query (best first).
-
-Tunable knobs: `top_n = 5 * top_k` and `top_chunks_per_page = 3` in
-`retrieve.py`; model names and `K_EVAL` in `utils.py`.
-
-## Submit
-
-Public GitHub repo with this code, **required** `artifacts/`, and a concise
-README documenting artifact paths. See the assignment PDF for video and grading
-details.
