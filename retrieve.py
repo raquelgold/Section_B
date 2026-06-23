@@ -1,29 +1,52 @@
-"""Query-time retrieval (timed portion includes query embedding)."""
+"""Query-time retrieval: recall-first dense -> cross-encoder rerank.
+
+Built from the ablations, not the picture:
+  * the task is multi-gold (up to 12 relevant pages/query) over 27k pages, so the
+    bottleneck is RECALL -- gold pages sit deep in the dense ranking (recall@50
+    ~0.46, recall@500 ~0.78). A 50-page rerank pool was starving the reranker.
+  * mean-pool dense >> max-pool here (0.38 vs 0.15): max-pool latches onto
+    spurious single 128-token chunks across the huge corpus.
+  * intro-paragraph clustering is a no-op (27k pages -> ~26.8k singletons), so
+    it's gone. So are MaxSim (hurt) and BM25 fusion (hurt as a ranking signal).
+
+Strategy: rank all pages by mean-pooled dense cosine, take a DEEP candidate pool,
+optionally union in BM25's top-K for extra recall, then let the cross-encoder
+rerank the pool down to the top-k. Knobs at the top.
+"""
 from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
-from sentence_transformers import CrossEncoder
-import torch
 
 from embed import embed_queries
 from index import load_index
-from utils import K_EVAL, CROSS_ENCODER_MODEL_NAME, iter_entries, entry_text
+from utils import K_EVAL
 
-_cross_encoder: CrossEncoder | None = None
+# --- knobs ----------------------------------------------------------------
+DENSE_POOL = "mean"          # chunk->page aggregation: "mean" (use this) or "max"
+CAND_POOL = 50               # dense candidates (union@50 recall ~0.86, fits 60s)
+BM25_RECALL_K = 50           # union BM25 top-K -- recovers gold dense misses
+CE_CHUNKS_PER_PAGE = 2       # best 2 chunks/page -> 0.4486 (sweep winner, ~40s/50q)
+CE_BATCH = 128               # cross-encoder batch size (GPU throughput)
+RERANK_MODE = "cross_encoder"  # "cross_encoder" | "none" (dense-only)
+# --------------------------------------------------------------------------
+
+_ce_model = None
 
 
-def get_cross_encoder() -> CrossEncoder:
-    """Lazy initialization of the Cross-Encoder model."""
-    global _cross_encoder
-    if _cross_encoder is None:
+def _get_ce():
+    global _ce_model
+    if _ce_model is None:
+        import torch
+        from sentence_transformers import CrossEncoder
+        from utils import CROSS_ENCODER_MODEL_NAME
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Using device for cross-encoder:", device)
-        _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL_NAME, device=device)
-    return _cross_encoder
+        _ce_model = CrossEncoder(CROSS_ENCODER_MODEL_NAME, device=device)
+    return _ce_model
 
 
 def search_batch(
@@ -32,84 +55,87 @@ def search_batch(
     top_k: int = K_EVAL,
     artifacts_dir: Optional[Path] = None,
 ) -> List[List[int]]:
-    """
-    Return ranked page_id lists (best first) for each query.
-
-    Default: brute-force dot product on L2-normalized vectors.
-    Replace with FAISS / reranking as needed.
-    """
-    corpus_vectors, corpus_texts, page_ids = load_index(artifacts_dir)
+    loaded = load_index(artifacts_dir)
+    corpus_vectors, corpus_texts, chunk_page_ids = loaded[0], loaded[1], loaded[2]
     query_vectors = embed_queries(queries)
 
     print("Querying")
     if query_vectors.size == 0:
         return [[] for _ in queries]
 
-    top_n = 5 * top_k
-    top_chunks_per_page = 3
+    # ---- precompute page universe + chunk->page map (once) ----
+    page_order: List[int] = []
+    page_chunks: Dict[int, List[int]] = defaultdict(list)
+    seen = set()
+    for ci, pid in enumerate(chunk_page_ids):
+        ip = int(pid)
+        if ip not in seen:
+            seen.add(ip); page_order.append(ip)
+        page_chunks[ip].append(ci)
+    num_pages = len(page_order)
+    page_idx = {pid: i for i, pid in enumerate(page_order)}
+    chunk_to_page = np.array([page_idx[int(p)] for p in chunk_page_ids], dtype=np.int64)
 
-    pid_to_chunk_indices = defaultdict(list)
-    for idx, pid in enumerate(page_ids):
-        pid_to_chunk_indices[int(pid)].append(idx)
+    # ---- optional BM25 recall source ----
+    bm25 = None
+    bm25_gather = None
+    if BM25_RECALL_K > 0:
+        from bm25 import load_bm25
+        bm25 = load_bm25(artifacts_dir if artifacts_dir is not None else Path("artifacts"))
+        bm25_pos = {pid: i for i, pid in enumerate(bm25.page_ids)}
+        bm25_gather = np.array([bm25_pos.get(pid, -1) for pid in page_order], dtype=np.int64)
 
-    scores = query_vectors @ corpus_vectors.T
+    dense_all = query_vectors @ corpus_vectors.T          # (Q, num_chunks)
+    ce = _get_ce() if RERANK_MODE == "cross_encoder" else None
 
-    unique_pids = []
-    seen_pids = set()
-    for pid in page_ids:
-        if pid not in seen_pids:
-            int_pid = int(pid)
-            seen_pids.add(int_pid)
-            unique_pids.append(int_pid)
-
-    num_unique_pids = len(unique_pids)
-    pid_to_idx = {pid: i for i, pid in enumerate(unique_pids)}
-    chunk_to_unique_idx = np.array([pid_to_idx[pid] for pid in page_ids], dtype=np.int32)
-    chunk_counts = np.bincount(chunk_to_unique_idx, minlength=num_unique_pids)
-    safe_counts = np.maximum(chunk_counts, 1)
-
-    cross_encoder = get_cross_encoder()
     ranked: List[List[int]] = []
-    for query_idx, row in enumerate(scores):
-        query_str = queries[query_idx]
+    for qi, q in enumerate(queries):
+        row = dense_all[qi]
 
-        page_sums = np.zeros(num_unique_pids, dtype=np.float32)
-        np.add.at(page_sums, chunk_to_unique_idx, row)
-        page_means = page_sums / safe_counts
-        top_n_indices = np.argsort(-page_means)[:top_n]
-        candidate_pids = [unique_pids[idx] for idx in top_n_indices]
+        # dense page score (mean-pool, or max)
+        if DENSE_POOL == "max":
+            dense_page = np.full(num_pages, -np.inf, dtype=np.float32)
+            np.maximum.at(dense_page, chunk_to_page, row)
+        else:
+            s = np.zeros(num_pages, dtype=np.float32)
+            c = np.zeros(num_pages, dtype=np.float32)
+            np.add.at(s, chunk_to_page, row)
+            np.add.at(c, chunk_to_page, 1.0)
+            dense_page = s / np.maximum(c, 1.0)
 
-        pairs = []
-        pair_to_pid_map = []
+        # deep candidate pool by dense rank
+        dorder = np.argsort(-dense_page)
+        cand = list(dorder[:CAND_POOL])
 
-        for pid in candidate_pids:
-            global_chunk_indices = pid_to_chunk_indices[pid]
-            page_chunk_scores = row[global_chunk_indices]
-            top_sub_indices = np.argsort(-page_chunk_scores)[:top_chunks_per_page]
-            selected_global_indices = [global_chunk_indices[i] for i in top_sub_indices]
-            for ch_idx in selected_global_indices:
-                pairs.append((query_str, corpus_texts[ch_idx]))
-                pair_to_pid_map.append(pid)
-        if not pairs:
-            ranked.append(candidate_pids[:top_k])
+        # optionally widen recall with BM25's top-K
+        if bm25 is not None:
+            braw = bm25.score(q)
+            bpage = np.where(bm25_gather >= 0, braw[bm25_gather], -np.inf)
+            btop = np.argsort(-bpage)[:BM25_RECALL_K]
+            seen_c = set(cand)
+            for p in btop:
+                if p not in seen_c and bpage[p] > 0:
+                    cand.append(int(p)); seen_c.add(int(p))
+
+        if ce is None:
+            ranked.append([page_order[p] for p in cand[:top_k]])
             continue
 
-        rerank_scores = cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False)
+        # cross-encoder rerank: best chunk(s) per candidate page
+        pairs, owner = [], []
+        for p in cand:
+            pid = page_order[p]
+            cidx = page_chunks[pid]
+            best = sorted(cidx, key=lambda c: row[c], reverse=True)[:CE_CHUNKS_PER_PAGE]
+            for c in best:
+                pairs.append((q, corpus_texts[c]))
+                owner.append(p)
+        scores = ce.predict(pairs, batch_size=CE_BATCH, show_progress_bar=False)
+        agg: Dict[int, list] = defaultdict(list)
+        for sc, p in zip(scores, owner):
+            agg[p].append(sc)
+        ordered = sorted(cand, key=lambda p: np.mean(agg[p]), reverse=True)
+        ranked.append([page_order[p] for p in ordered[:top_k]])
 
-        pid_to_ce_scores = defaultdict(list)
-        for score, pid in zip(rerank_scores, pair_to_pid_map):
-            pid_to_ce_scores[pid].append(score)
-        pid_final_scores = {}
-        for pid in candidate_pids:
-            ce_list = pid_to_ce_scores.get(pid, [])
-            pid_final_scores[int(pid)] = np.mean(ce_list) if ce_list else -np.inf
-
-        final_pids = sorted(candidate_pids, key=lambda pid: pid_final_scores[pid], reverse=True)[:top_k]
-        ranked.append(final_pids)
-
-        print(f"\nQuery {query_idx}")
-        print(f"Candidate pages: {candidate_pids}")
-        print(f"Final pages: {final_pids}")
-
-    print(f"\nFound {sum([len(r) for r in ranked])} ranked pages\n")
+    print(f"\nFound {sum(len(r) for r in ranked)} ranked pages\n")
     return ranked
