@@ -1,62 +1,64 @@
-# Section B — Retrieval pipeline
+# Section B: 
 
-Implementation of an end-to-end retrieval pipeline over a collection of textual
-Wikipedia-style entries. The system receives a batch of queries and returns, for each
-query, a ranked list of relevant page id values.
+We created a retrieval pipeline designed for page ranking. This system combines Dense Semantic Embeddings (Bi-Encoder) and a Lexical Index (BM25) via Reciprocal Rank Fusion (RRF), finalized by a MaxSim Token Reranker.
 
-## Setup
+---
+
+### `chunk.py`
+
+This module handles text preprocessing by partitioning raw, variable-length Wikipedia pages into uniform retrieval units. It utilizes a sliding window mechanism that restricts text segments to a maximum of 180 tokens with a 25-token overlap to prevent context loss at boundary seams.
+
+### `index.py`
+
+This offline module builds the unified storage structures required for rapid query matching. It coordinates with `chunk.py` to extract text fragments, calls the embedding model to generate dense L2-normalized vectors, and saves these vector blocks along with their matching page indices.
+
+### `retrieve.py`
+
+This runtime retrieval engine executes a multi-stage hybrid search strategy by scoring and merging results from the dense and lexical tracks. For every input query, it conducts a rapid matrix multiplication to fetch dense chunk similarities while running a vectorized cluster-level BM25 search. These candidate feeds are combined using Reciprocal Rank Fusion (RRF), boosted with flat score injections whenever high-precision verbatim strings (like proper nouns or serial numbers) match the text, and ultimately refined using a fine-grained token-level MaxSim alignment matrix to rerank the top 30 candidates.
+
+## 💾 Precomputed Index Artifacts
+
+All essential indexing data structures are stored locally within the repository under the `artifacts/` folder.
+
+Pretrained model weights for `sentence-transformers/all-MiniLM-L6-v2` are fetched dynamically from the HuggingFace hub at runtime.
+
+### Artifact Registry
+
+| Relative Path | Format | Description |
+| --- | --- | --- |
+| `artifacts/index_vectors.npy` | Binary NumPy (`.npy`) | L2-normalized dense embedding vectors ($\mathbb{R}^{N \times 384}$) generated across all text chunks. |
+| `artifacts/index_meta.json` | JSON | Structural metadata containing sequential mappings of `page_ids`, `chunk_ids`, and the source model configurations. |
+| `artifacts/lexical_index.npz` | Compressed Archive (`.npz`) | Compact representation containing vocabulary lookups, Inverse Document Frequencies (IDF), token length priors, and an inverted index structured in **Compressed Sparse Row (CSR)** layout (`indptr`, `docs`, `tfs`). |
+
+---
+
+## 🚀 Setup & Execution Guide
+
+### 1. Cloning the Repository
+
+Since the precomputed indexing artifacts are tracked using Git LFS, ensure LFS is initialized on your system before cloning:
 
 ```bash
-cd student@dpagpu2025s-0038:~/our_solution/Section_B/Section_B  #WE NEED TO CLEAN THIS AFTERWARDS SO THAT IT DOESNT HAVE SECTION_b DUPLICATE
-pip install -r requirements.txt
-```
-### GPU (CUDA) torch
- 
-To pull a CUDA-enabled torch build, `requirements.txt` includes a PyTorch index
-and a CUDA-tagged pin:
- 
-```
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1+cu121
-```
- 
-`pip install -r requirements.txt` then installs the GPU wheel automatically. 
+# Ensure Git LFS is installed locally
+git lfs install
 
-Models download from the Hugging Face Hub on first use and are cached after:
-`all-MiniLM-L6-v2` (bi-encoder, 384-dim) and `ms-marco-MiniLM-L6-v2`
-(cross-encoder).
+# Clone the repository
+git clone https://github.com/raquelgold/Section_B.git
+cd Section_B
 
-## Build index (offline)
-
-Run once locally to create `artifacts/`. 
-
-```bash
-python scripts/build_index.py
 ```
 
-### Artifacts produced
+### 2. Evaluation Execution
 
-| Path | Contents |
-|------|----------|
-| `artifacts/index_vectors.npy` | `(num_chunks, 384)` L2-normalized chunk embeddings. |
-| `artifacts/index_meta.json` | Parallel chunk metadata: `page_ids`, `chunk_ids`, `texts`, `model`, `num_vectors`. |
-
-Row `i` of `index_vectors.npy` corresponds to entry `i` in each list in
-`index_meta.json`. At query time `retrieve.py` loads both, scores chunks, then
-aggregates chunk scores up to `page_id`.
-
-## Public self-test
+Run the evaluation suite directly:
 
 ```bash
 python scripts/eval_public.py
+
 ```
 
-This loads `artifacts/`, runs `run()` over `data/public_queries.json`, and reports mean NDCG@10.
+---
 
-## Our Pipeline (what `run()` does at query time)
+## 👥 Collaboration Log
 
-1. Embed the query batch.
-2. Dot-product against all chunk vectors, then average per page.
-3. Keep the top `5 × K` candidate pages.
-4. Re-rank: cross-encoder scores the top 3 chunks of each candidate, averaged per page.
-5. Return the top `K = 10` page IDs per query (best first).
+This repository was built by Itav Dan and Raquel Goldsztejn, for more information on our logic process look at our video describing what we did and why:
