@@ -1,52 +1,209 @@
-"""Query-time retrieval: recall-first dense -> cross-encoder rerank.
-
-Built from the ablations, not the picture:
-  * the task is multi-gold (up to 12 relevant pages/query) over 27k pages, so the
-    bottleneck is RECALL -- gold pages sit deep in the dense ranking (recall@50
-    ~0.46, recall@500 ~0.78). A 50-page rerank pool was starving the reranker.
-  * mean-pool dense >> max-pool here (0.38 vs 0.15): max-pool latches onto
-    spurious single 128-token chunks across the huge corpus.
-  * intro-paragraph clustering is a no-op (27k pages -> ~26.8k singletons), so
-    it's gone. So are MaxSim (hurt) and BM25 fusion (hurt as a ranking signal).
-
-Strategy: rank all pages by mean-pooled dense cosine, take a DEEP candidate pool,
-optionally union in BM25's top-K for extra recall, then let the cross-encoder
-rerank the pool down to the top-k. Knobs at the top.
-"""
 from __future__ import annotations
 
-from collections import defaultdict
+import json
 from pathlib import Path
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
 
 from embed import embed_queries
 from index import load_index
-from utils import K_EVAL
+from utils import K_EVAL, ARTIFACTS_DIR
 
-# --- knobs ----------------------------------------------------------------
-DENSE_POOL = "mean"          # chunk->page aggregation: "mean" (use this) or "max"
-CAND_POOL = 50               # dense candidates (union@50 recall ~0.86, fits 60s)
-BM25_RECALL_K = 50           # union BM25 top-K -- recovers gold dense misses
-CE_CHUNKS_PER_PAGE = 2       # best 2 chunks/page -> 0.4486 (sweep winner, ~40s/50q)
-CE_BATCH = 128               # cross-encoder batch size (GPU throughput)
-RERANK_MODE = "cross_encoder"  # "cross_encoder" | "none" (dense-only)
-# --------------------------------------------------------------------------
-
-_ce_model = None
+# --- Globals & Singletons ---
+_LOADED_CORPUS_EMBEDDINGS: Optional[np.ndarray] = None
+_LOADED_PAGE_IDENTIFIERS: Optional[np.ndarray] = None
+_GLOBAL_CLUSTER_INDEX: Optional[AggregatedClusterIndex] = None
+_CHUNK_INDEX_TO_CLUSTER_ID_MAP: Optional[np.ndarray] = None
 
 
-def _get_ce():
-    global _ce_model
-    if _ce_model is None:
-        import torch
-        from sentence_transformers import CrossEncoder
-        from utils import CROSS_ENCODER_MODEL_NAME
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print("Using device for cross-encoder:", device)
-        _ce_model = CrossEncoder(CROSS_ENCODER_MODEL_NAME, device=device)
-    return _ce_model
+class AggregatedClusterIndex:
+    """Manages lexical information and document mappings across document entity clusters."""
+
+    def __init__(self, storage_directory: Optional[Path] = None):
+        root_path = Path(storage_directory) if storage_directory is not None else Path(ARTIFACTS_DIR)
+        index_archive = np.load(root_path / "lexical_index.npz")
+
+        # Core statistics and inverted index components
+        self.cluster_token_lengths = index_archive["dls"].astype(np.float64)
+        self.inverse_document_frequencies = index_archive["idf"]
+        self.compressed_sparse_row_pointers = index_archive["indptr"]
+        self.posting_cluster_ids = index_archive["docs"]
+        self.posting_term_frequencies = index_archive["tfs"]
+
+        # Structural metadata payload
+        metadata_payload = json.loads(str(index_archive["metadata"]))
+        self.cluster_to_page_mappings: List[List[int]] = metadata_payload["clusters"]
+        self.vocabulary_lookup: Dict[str, int] = metadata_payload["vocab"]
+        self.truncated_cluster_texts: List[str] = metadata_payload["texts"]
+
+        # Calculated helpers
+        self.total_clusters_count: int = len(self.cluster_to_page_mappings)
+        self.average_cluster_length: float = (
+            float(self.cluster_token_lengths.mean()) if self.total_clusters_count else 0.0
+        )
+        self.logarithm_length_prior = np.log(self.cluster_token_lengths + 1.0)
+
+        # Reverse lookup mapping page IDs to cluster indexes
+        self.page_to_cluster_map: Dict[int, int] = {
+            int(page_id): cluster_idx
+            for cluster_idx, member_pages in enumerate(self.cluster_to_page_mappings)
+            for page_id in member_pages
+        }
+
+    def compute_bm25_scores(
+        self, query_string: str, term_saturation_k1: float = 0.8, length_normalization_b: float = 0.75
+    ) -> np.ndarray:
+        """Calculates exact BM25 scores for all clusters against the input query."""
+        all_cluster_scores = np.zeros(self.total_clusters_count, dtype=np.float64)
+        length_penalty_denominator = term_saturation_k1 * (
+            1.0 - length_normalization_b + length_normalization_b * self.cluster_token_lengths / self.average_cluster_length
+        )
+        
+        token_pattern = re.compile(r"\b\w+\b")
+        unique_query_tokens = set(token_pattern.findall(query_string.lower()))
+
+        for individual_token in unique_query_tokens:
+            target_term_id = self.vocabulary_lookup.get(individual_token)
+            if target_term_id is None:
+                continue
+            
+            # Slice postings array boundaries for the given term
+            pointer_start = int(self.compressed_sparse_row_pointers[target_term_id])
+            pointer_end = int(self.compressed_sparse_row_pointers[target_term_id + 1])
+            
+            matching_cluster_ids = self.posting_cluster_ids[pointer_start:pointer_end]
+            term_frequencies = self.posting_term_frequencies[pointer_start:pointer_end].astype(np.float64)
+            
+            # Vectorized scoring calculation across clusters containing the term
+            all_cluster_scores[matching_cluster_ids] += (
+                self.inverse_document_frequencies[target_term_id]
+                * term_frequencies
+                * (term_saturation_k1 + 1.0)
+                / (term_frequencies + length_penalty_denominator[matching_cluster_ids])
+            )
+            
+        return all_cluster_scores
+
+
+def initialize_or_retrieve_indices(artifacts_dir: Optional[Path]) -> tuple:
+    """Ensures index assets are cached in memory and returns reference variables."""
+    global _LOADED_CORPUS_EMBEDDINGS, _LOADED_PAGE_IDENTIFIERS, _GLOBAL_CLUSTER_INDEX, _CHUNK_INDEX_TO_CLUSTER_ID_MAP
+    
+    if _LOADED_CORPUS_EMBEDDINGS is None:
+        _LOADED_CORPUS_EMBEDDINGS, _LOADED_PAGE_IDENTIFIERS = load_index(artifacts_dir)
+        _GLOBAL_CLUSTER_INDEX = AggregatedClusterIndex(artifacts_dir)
+        _CHUNK_INDEX_TO_CLUSTER_ID_MAP = np.array(
+            [_GLOBAL_CLUSTER_INDEX.page_to_cluster_map.get(int(pid), -1) for pid in _LOADED_PAGE_IDENTIFIERS]
+        )
+        
+    return _LOADED_CORPUS_EMBEDDINGS, _LOADED_PAGE_IDENTIFIERS, _GLOBAL_CLUSTER_INDEX, _CHUNK_INDEX_TO_CLUSTER_ID_MAP
+
+
+def extract_highest_dense_similarities(
+    chunk_scores: np.ndarray, page_ids: np.ndarray, chunk_to_cluster_map: np.ndarray, max_chunks_to_scan: int = 4000
+) -> tuple[Dict[int, float], Dict[int, float]]:
+    """Identifies peak similarity values per cluster and per document page from vector similarities."""
+    partition_pivot = min(max_chunks_to_scan, len(chunk_scores) - 1)
+    highest_scoring_indices = np.argpartition(-chunk_scores, partition_pivot)[:max_chunks_to_scan]
+    
+    peak_cluster_scores: Dict[int, float] = {}
+    peak_page_scores: Dict[int, float] = {}
+    
+    for matching_chunk_idx in highest_scoring_indices:
+        similarity_score = float(chunk_scores[matching_chunk_idx])
+        assigned_cluster_id = int(chunk_to_cluster_map[int(matching_chunk_idx)])
+        
+        if assigned_cluster_id >= 0:
+            peak_cluster_scores[assigned_cluster_id] = max(similarity_score, peak_cluster_scores.get(assigned_cluster_id, -1e30))
+            
+        assigned_page_id = int(page_ids[int(matching_chunk_idx)])
+        peak_page_scores[assigned_page_id] = max(similarity_score, peak_page_scores.get(assigned_page_id, -1e30))
+        
+    return peak_cluster_scores, peak_page_scores
+
+
+def convert_scores_to_rankings_map(score_dictionary: Dict[int, float], maximum_elements: int) -> Dict[int, int]:
+    """Generates an item-to-rank map containing up to maximum_elements items."""
+    sorted_items = sorted(score_dictionary, key=lambda identifier: -score_dictionary[identifier])[:maximum_elements]
+    return {identifier: rank_position for rank_position, identifier in enumerate(sorted_items)}
+
+
+def evaluate_token_max_similarity(query_token_vectors: np.ndarray, document_token_vectors: np.ndarray) -> float:
+    """Calculates late-interaction MaxSim metrics between normalized token matrix segments."""
+    normalized_query_tokens = query_token_vectors / (np.linalg.norm(query_token_vectors, axis=1, keepdims=True) + 1e-9)
+    normalized_doc_tokens = document_token_vectors / (np.linalg.norm(document_token_vectors, axis=1, keepdims=True) + 1e-9)
+    return float((normalized_query_tokens @ normalized_doc_tokens.T).max(axis=1).mean())
+
+
+def execute_token_level_reranking(
+    raw_query: str, Top_ranked_clusters: List[int], current_fusion_scores: Dict[int, float], cluster_ctx: AggregatedClusterIndex
+) -> List[int]:
+    """Adjusts the top-tier cluster sequence via fine-grained token alignment embeddings."""
+    max_rerank_depth = 30
+    interaction_blend_beta = 0.3
+    
+    candidate_head = Top_ranked_clusters[:max_rerank_depth]
+    if len(candidate_head) < 2 or not cluster_ctx.truncated_cluster_texts:
+        return Top_ranked_clusters
+        
+    from embed import get_model
+    embedding_model = get_model()
+    
+    query_tokens = embedding_model.encode([raw_query], output_value="token_embeddings")[0]
+    document_tokens_list = embedding_model.encode(
+        [cluster_ctx.truncated_cluster_texts[cid] for cid in candidate_head], output_value="token_embeddings"
+    )
+    
+    query_tokens_numpy = query_tokens.detach().cpu().numpy()
+    maxsim_metrics = np.array([
+        evaluate_token_max_similarity(query_tokens_numpy, single_doc_tokens.detach().cpu().numpy())
+        for single_doc_tokens in document_tokens_list
+    ])
+    
+    baseline_fusion_scores = np.array([current_fusion_scores[cid] for cid in candidate_head])
+    
+    # Standardize scale variants
+    maxsim_metrics = (maxsim_metrics - maxsim_metrics.mean()) / (maxsim_metrics.std() + 1e-9)
+    baseline_fusion_scores = (baseline_fusion_scores - baseline_fusion_scores.mean()) / (baseline_fusion_scores.std() + 1e-9)
+    
+    combined_scores = -(baseline_fusion_scores + interaction_blend_beta * maxsim_metrics)
+    sorted_candidate_head = [candidate_head[index] for index in np.argsort(combined_scores)]
+    
+    return sorted_candidate_head + Top_ranked_clusters[max_rerank_depth:]
+
+
+def detect_high_precision_verbatim_terms(query_string: str) -> List[str]:
+    """Finds exact alphanumeric expressions within query strings."""
+    big_number_expression = re.compile(r"\b\d[\d,]{3,}\b")
+    proper_noun_expression = re.compile(r"(?<!^)\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
+    return big_number_expression.findall(query_string) + proper_noun_expression.findall(query_string)
+
+
+def apply_reciprocal_rank_fusion(
+    lexical_rankings: Dict[int, int],
+    semantic_rankings: Dict[int, int],
+    cluster_ctx: AggregatedClusterIndex,
+    lexical_weight_alpha: float = 0.85,
+    rrf_smoothing_constant: int = 60,
+    short_length_penalty: float = 0.005,
+) -> Dict[int, float]:
+    """Combines dual structural rankings into unified scores penalized by length weights."""
+    fused_score_registry: Dict[int, float] = {}
+    combined_cluster_ids = set(lexical_rankings) | set(semantic_rankings)
+    
+    for cluster_id in combined_cluster_ids:
+        fusion_accumulator = 0.0
+        if cluster_id in lexical_rankings:
+            fusion_accumulator += lexical_weight_alpha / (rrf_smoothing_constant + lexical_rankings[cluster_id])
+        if cluster_id in semantic_rankings:
+            fusion_accumulator += (1.0 - lexical_weight_alpha) / (rrf_smoothing_constant + semantic_rankings[cluster_id])
+            
+        fusion_accumulator -= short_length_penalty * cluster_ctx.logarithm_length_prior[cluster_id]
+        fused_score_registry[cluster_id] = fusion_accumulator
+        
+    return fused_score_registry
 
 
 def search_batch(
@@ -55,87 +212,57 @@ def search_batch(
     top_k: int = K_EVAL,
     artifacts_dir: Optional[Path] = None,
 ) -> List[List[int]]:
-    loaded = load_index(artifacts_dir)
-    corpus_vectors, corpus_texts, chunk_page_ids = loaded[0], loaded[1], loaded[2]
-    query_vectors = embed_queries(queries)
-
-    print("Querying")
-    if query_vectors.size == 0:
+    """Accepts multiple queries and delivers a list of relevant page IDs per query string."""
+    corpus_embeds, page_ids, cluster_index, chunk_to_cluster = initialize_or_retrieve_indices(artifacts_dir)
+    query_embeddings = embed_queries(queries)
+    
+    if query_embeddings.size == 0:
         return [[] for _ in queries]
 
-    # ---- precompute page universe + chunk->page map (once) ----
-    page_order: List[int] = []
-    page_chunks: Dict[int, List[int]] = defaultdict(list)
-    seen = set()
-    for ci, pid in enumerate(chunk_page_ids):
-        ip = int(pid)
-        if ip not in seen:
-            seen.add(ip); page_order.append(ip)
-        page_chunks[ip].append(ci)
-    num_pages = len(page_order)
-    page_idx = {pid: i for i, pid in enumerate(page_order)}
-    chunk_to_page = np.array([page_idx[int(p)] for p in chunk_page_ids], dtype=np.int64)
+    similarity_matrix = query_embeddings @ corpus_embeds.T
+    aggregated_batch_results: List[List[int]] = []
 
-    # ---- optional BM25 recall source ----
-    bm25 = None
-    bm25_gather = None
-    if BM25_RECALL_K > 0:
-        from bm25 import load_bm25
-        bm25 = load_bm25(artifacts_dir if artifacts_dir is not None else Path("artifacts"))
-        bm25_pos = {pid: i for i, pid in enumerate(bm25.page_ids)}
-        bm25_gather = np.array([bm25_pos.get(pid, -1) for pid in page_order], dtype=np.int64)
+    for query_index, literal_query in enumerate(queries):
+        dense_cluster_max, dense_page_max = extract_highest_dense_similarities(
+            similarity_matrix[query_index], page_ids, chunk_to_cluster, max_chunks_to_scan=4000
+        )
+        
+        lexical_cluster_scores = cluster_index.compute_bm25_scores(literal_query)
+        lexical_candidate_bound = min(80, len(lexical_cluster_scores) - 1)
+        lexical_top_indices = np.argpartition(-lexical_cluster_scores, lexical_candidate_bound)[:80]
+        
+        filtered_lexical_scores = {
+            int(cid): float(lexical_cluster_scores[cid]) for cid in lexical_top_indices if lexical_cluster_scores[cid] > 0
+        }
 
-    dense_all = query_vectors @ corpus_vectors.T          # (Q, num_chunks)
-    ce = _get_ce() if RERANK_MODE == "cross_encoder" else None
+        lexical_rank_map = convert_scores_to_rankings_map(filtered_lexical_scores, maximum_elements=80)
+        semantic_rank_map = convert_scores_to_rankings_map(dense_cluster_max, maximum_elements=80)
 
-    ranked: List[List[int]] = []
-    for qi, q in enumerate(queries):
-        row = dense_all[qi]
+        fused_scores = apply_reciprocal_rank_fusion(
+            lexical_rank_map, semantic_rank_map, cluster_index, lexical_weight_alpha=0.85, rrf_smoothing_constant=60, short_length_penalty=0.005
+        )
 
-        # dense page score (mean-pool, or max)
-        if DENSE_POOL == "max":
-            dense_page = np.full(num_pages, -np.inf, dtype=np.float32)
-            np.maximum.at(dense_page, chunk_to_page, row)
-        else:
-            s = np.zeros(num_pages, dtype=np.float32)
-            c = np.zeros(num_pages, dtype=np.float32)
-            np.add.at(s, chunk_to_page, row)
-            np.add.at(c, chunk_to_page, 1.0)
-            dense_page = s / np.maximum(c, 1.0)
+        # Apply specific bonuses if high-precision tokens appear in content
+        matched_exact_tokens = detect_high_precision_verbatim_terms(literal_query)
+        if matched_exact_tokens and cluster_index.truncated_cluster_texts:
+            for cluster_id in fused_scores:
+                target_text = cluster_index.truncated_cluster_texts[cluster_id]
+                if any(token_element in target_text for token_element in matched_exact_tokens):
+                    fused_scores[cluster_id] += 0.05
 
-        # deep candidate pool by dense rank
-        dorder = np.argsort(-dense_page)
-        cand = list(dorder[:CAND_POOL])
+        prioritized_clusters = sorted(fused_scores, key=lambda cid: -fused_scores[cid])
+        prioritized_clusters = execute_token_level_reranking(literal_query, prioritized_clusters, fused_scores, cluster_index)
 
-        # optionally widen recall with BM25's top-K
-        if bm25 is not None:
-            braw = bm25.score(q)
-            bpage = np.where(bm25_gather >= 0, braw[bm25_gather], -np.inf)
-            btop = np.argsort(-bpage)[:BM25_RECALL_K]
-            seen_c = set(cand)
-            for p in btop:
-                if p not in seen_c and bpage[p] > 0:
-                    cand.append(int(p)); seen_c.add(int(p))
+        # Assemble and flatten the final target sequence of pages
+        query_output_page_ids: List[int] = []
+        for cluster_id in prioritized_clusters:
+            cluster_member_pages = cluster_index.cluster_to_page_mappings[cluster_id]
+            sorted_member_pages = sorted(cluster_member_pages, key=lambda pid: -dense_page_max.get(pid, -1e30))
+            
+            query_output_page_ids.extend(sorted_member_pages)
+            if len(query_output_page_ids) >= top_k:
+                break
+                
+        aggregated_batch_results.append(query_output_page_ids[:top_k])
 
-        if ce is None:
-            ranked.append([page_order[p] for p in cand[:top_k]])
-            continue
-
-        # cross-encoder rerank: best chunk(s) per candidate page
-        pairs, owner = [], []
-        for p in cand:
-            pid = page_order[p]
-            cidx = page_chunks[pid]
-            best = sorted(cidx, key=lambda c: row[c], reverse=True)[:CE_CHUNKS_PER_PAGE]
-            for c in best:
-                pairs.append((q, corpus_texts[c]))
-                owner.append(p)
-        scores = ce.predict(pairs, batch_size=CE_BATCH, show_progress_bar=False)
-        agg: Dict[int, list] = defaultdict(list)
-        for sc, p in zip(scores, owner):
-            agg[p].append(sc)
-        ordered = sorted(cand, key=lambda p: np.mean(agg[p]), reverse=True)
-        ranked.append([page_order[p] for p in ordered[:top_k]])
-
-    print(f"\nFound {sum(len(r) for r in ranked)} ranked pages\n")
-    return ranked
+    return aggregated_batch_results
