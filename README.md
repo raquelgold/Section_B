@@ -62,3 +62,4 @@ python scripts/eval_public.py
 ## 👥 Collaboration Log
 
 This repository was built by Itav Dan and Raquel Goldsztejn, for more information on our logic process look at our video describing what we did and why:
+https://drive.google.com/file/d/1-_BOqB0DFcowDAAsIBAw9TMG25wa3n61/view?usp=sharing
