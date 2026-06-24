@@ -1,4 +1,4 @@
-"""Optional preprocessing and chunking."""
+"""Preprocessing and chunking of corpus pages into retrieval units."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +6,11 @@ from typing import Any, Dict, List
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-from utils import entry_text, EMBEDDING_MODEL_NAME
+from utils import EMBEDDING_MODEL_NAME
+
+
+CHUNK_SIZE = 180
+CHUNK_OVERLAP = 25
 
 
 @dataclass
@@ -14,13 +18,13 @@ class Chunk:
     page_id: int
     chunk_id: int
     text: str
-    tokens: int
 
 
 _tokenizer: AutoTokenizer | None = None
 
 
-def get_tokenizer() -> AutoTokenizer | None:
+def get_tokenizer() -> AutoTokenizer:
+    """Lazy initialization of the official model tokenizer."""
     global _tokenizer
     if _tokenizer is None:
         _tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_NAME)
@@ -28,58 +32,46 @@ def get_tokenizer() -> AutoTokenizer | None:
 
 
 def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
-    """
-    Split one corpus entry into retrieval units.
-
-    Default: single chunk per page (no chunking). Override for fixed-size or
-    semantic chunking strategies.
-    """
+    """Split one corpus entry into stable, token-bounded sliding windows."""
     page_id = int(record["page_id"])
-    text = entry_text(record)
+    title = record.get("title", "").strip()
+    content = record.get("content", "").strip()
+
+    if not content:
+        return []
 
     tokenizer = get_tokenizer()
-    tokens = tokenizer.encode(text, add_special_tokens=False)
+    tokens = tokenizer.encode(content, add_special_tokens=False)
     n = len(tokens)
 
-    configs = [
-        (512, 50),
-        (256, 25),
-        (128, 10),
-    ]
+    if n <= CHUNK_SIZE:
+        return [Chunk(page_id=page_id, chunk_id=0, text=f"{title}: {content}")]
+
     chunks: List[Chunk] = []
     chunk_id = 0
-    for window_size, overlap in configs:
-        if n <= window_size:
-            chunk_text = tokenizer.decode(tokens)
-            chunks.append(Chunk(page_id=page_id, chunk_id=chunk_id, text=chunk_text, tokens=n))
-            chunk_id += 1
-            continue
+    start = 0
+    step = CHUNK_SIZE - CHUNK_OVERLAP
 
-        start = 0
-        step = window_size - overlap
-        while start + window_size < n:
-            end = start + window_size
-            chunk_tokens = tokens[start:end]
-            chunk_text = tokenizer.decode(chunk_tokens)
-            chunks.append(Chunk(page_id=page_id, chunk_id=chunk_id, text=chunk_text, tokens=len(chunk_tokens)))
-            chunk_id += 1
+    while start < n:
+        end = min(start + CHUNK_SIZE, n)
+        chunk_tokens = tokens[start:end]
+        chunk_text = tokenizer.decode(chunk_tokens).strip()
 
-            if end == n:
-                break
-            start += step
+        chunks.append(Chunk(
+            page_id=page_id,
+            chunk_id=chunk_id,
+            text=f"{title}: {chunk_text}"
+        ))
+        chunk_id += 1
 
-        last_tokens = tokens[n - window_size: n]
-        last_text = tokenizer.decode(last_tokens)
-        chunks.append(Chunk(page_id=page_id, chunk_id=chunk_id, text=last_text, tokens=len(last_tokens)))
+        if end == n:
+            break
+        start += step
 
     return chunks
 
-
 def chunk_corpus(records: List[Dict[str, Any]]) -> List[Chunk]:
-    print("Chunking")
-
     chunks: List[Chunk] = []
-    for record in tqdm(records, total=len(records)):
+    for record in tqdm(records):
         chunks.extend(chunk_entry(record))
-    print(f"Found {len(chunks)} chunks\n")
     return chunks
